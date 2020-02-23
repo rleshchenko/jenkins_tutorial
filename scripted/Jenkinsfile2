@@ -1,0 +1,201 @@
+String[] getChangedFilesList() {
+
+    changedFiles = []
+    def changeLogSets = currentBuild.changeSets
+    for (int i = 0; i < changeLogSets.size(); i++) {
+        def entries = changeLogSets[i].items
+        for (int j = 0; j < entries.length; j++) {
+            def entry = entries[j]
+            def files = new ArrayList(entry.affectedFiles)
+            for (int k = 0; k < files.size(); k++) {
+                def file = files[k]
+                changedFiles.add(file.getPath())
+            }
+        }
+    }
+
+    return changedFiles
+}
+
+String USER_INPUT = '';
+String PORT = ''
+environment {
+    COMPOSER_AUTH = '{"http-basic":{"repo.magento.com": {"username": "6db5905a1a34f710e7ec7d517c09941a", "password": "69da3fa354be9e291e23d0de3954e9de"}}}'
+}
+
+parameters {
+    string defaultValue: 'notSet', description: '', name: 'Branch', trim: false
+    choice choices: ['10.16.0'], description: 'Node Version', name: 'node'
+    choice choices: ['7.2.22'], description: 'PHP version', name: 'php'
+    choice choices: ['Yes', 'No'], defaultValue: 'No', description: 'Use Apache2 open port?', name: 'open_port'
+}
+
+node(label: 'master') {
+    withEnv(['COMPOSER_AUTH={"http-basic":{"repo.magento.com": {"username": "6db5905a1a34f710e7ec7d517c09941a", "password": "69da3fa354be9e291e23d0de3954e9de"}}}']) {
+        checkout scm
+        try {
+            script {
+                ServerSocket s = new ServerSocket(0);
+                PORT = s.getLocalPort()
+            }
+            script {
+                if (params.Branch != 'notSet' && params.Branch) {
+                    git credentialsId: 'github2', url: 'git@github.com:FluidDigitalGit/modaM2.git', branch: "${params.Branch}"
+                }
+                if (env.BRANCH_NAME) {
+                    git credentialsId: 'github2', url: 'git@github.com:FluidDigitalGit/modaM2.git', branch: "$env.BRANCH_NAME"
+                }
+            }
+            docker.withRegistry('', 'dockerhub') {
+                docker.image('ozlz/test').inside(
+                        "-u root:sudo -p 80:${PORT} -v /usr/bin/docker:/usr/bin/docker -v /var/run/docker.sock:/var/run/docker.sock"
+                ) {
+                    try {
+                        stage('Composer install') {
+                            notifyBuild("BUILD STARTED")
+                            sh 'update-alternatives --set php /usr/bin/php7.2'
+                            sh 'composer global require hirak/prestissimo'
+                            sh 'composer install --no-interaction'
+                        }
+                        stage('Static analysis') {
+                            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                                script {
+                                    def changedFiles = getChangedFilesList().join(' ')
+                                    if (changedFiles) {
+                                        sh "${WORKSPACE}/vendor/bin/phpcs --standard=vendor/magento/magento-coding-standard/Magento2 $changedFiles"
+                                    }
+                                }
+                            }
+                        }
+                        stage('Slug creation') {
+                            script {
+                                def HOST = sh(script: 'echo ${PWD##*/}', , returnStdout: true).trim()
+                                sh 'composer install --no-interaction'
+                                sh 'chown -R mysql:mysql /var/lib/mysql /var/run/mysqld && service mysql start && mysql -uroot -p -e "DROP DATABASE IF EXISTS magento2; CREATE DATABASE magento2;"'
+                                sh 'touch app/etc/env.php'
+                                sh 'rm app/etc/env.php'
+                                sh 'cd ${WORKSPACE}/docker && zcat modam2_dump.sql.gz | mysql -uroot -h127.0.0.1 magento2'
+                                sh "mysql -uroot -h127.0.0.1 -e 'use magento2; update core_config_data set value = \"http://35.214.69.92/$HOST/\" where value like \"%base_url%\"'"
+                                sh "php bin/magento setup:install --base-url=http://35.214.69.92/$HOST/ --db-host=localhost --db-name=magento2 --db-user=root --admin-firstname=Magento --admin-lastname=User --admin-email=user@example.com --admin-user=admin --admin-password=admin123 --language=en_US --currency=USD --timezone=America/Chicago --use-rewrites=1 --backend-frontname=admin"
+                                sh 'php bin/magento setup:upgrade'
+                                sh 'php bin/magento setup:di:compile'
+                                sh 'source /usr/local/nvm/nvm.sh && source ~/.bashrc && nvm install v10.16.0 && nvm use v10.16.0 && cd ${WORKSPACE}/app/design/frontend/Fluid/blank && npm install && gulp && cd ${WORKSPACE}'
+                                sh 'php bin/magento setup:static-content:deploy -f'
+                                sh 'truncate -s 0 var/log/*log'
+                                sh 'ln -sfn ${WORKSPACE} /var/www/'
+                                sh 'rm ${WORKSPACE}/var/log/*'
+                                sh 'rm -rf ${WORKSPACE}/var/cache/*'
+                                sh '''
+                         chown -R www-data:www-data /var/www && chown -R mysql:mysql /var/lib/mysql /var/run/mysqld \
+                         && service mysql start \
+                    '''
+                                sh 'find app/code var/view_preprocessed vendor pub/static app/etc generated/code generated/metadata \\( -type f -or -type d \\) -exec chmod u-w {} + && chmod o-rwx app/etc/env.php && chmod u+x bin/magento'
+                                sh 'chmod -R 777 ${WORKSPACE}'
+                            }
+                        }
+                        stage('Debug') {
+                            script {
+                                try {
+                                    timeout(time: 1, unit: 'MINUTES') {
+                                        USER_INPUT = input(
+                                                message: 'User input required - Give you a time for manual testing?',
+                                                parameters: [
+                                                        [
+                                                                $class     : 'ChoiceParameterDefinition',
+                                                                choices    : ['Yes', 'No'].join('\n'),
+                                                                name       : 'input',
+                                                                description: 'Menu - select box option']
+                                                ]
+                                        )
+
+                                        echo "The answer is: ${USER_INPUT}"
+
+                                        if ("${USER_INPUT}" == "yes") {
+                                            sh "a2enmod rewrite && service apache2 restart"
+                                        } else {
+
+                                        }
+                                    }
+                                } catch (err) {
+                                    def user = err.getCauses()[0].getUser()
+                                    if ('SYSTEM' == user.toString()) {
+                                        didTimeout = true
+                                    } else {
+                                        userInput = false
+                                        echo "Aborted by: [${user}]"
+                                    }
+                                }
+                            }
+                        }
+                        stage('Manual Testing') {
+                            script {
+                                sh 'chmod -R 777 ${WORKSPACE}'
+                                if ("${USER_INPUT}" == "yes") {
+                                    timeout(time: 20, unit: 'MINUTES') {
+                                        input(
+                                                id: 'Proceed1',
+                                                message: 'Was this successful?',
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    } catch (e) {
+                        sh "chmod -R 777 ${WORKSPACE}"
+                        notifyBuild("EPIC FAIL")
+                        throw e
+                    }
+                }
+            }
+        } catch (e) {
+            throw e
+        } finally {
+            if (currentBuild.currentResult == 'SUCCESS') {
+                notifyBuild("BUILD FINISHED")
+                String DEPLOY_BRANCH = 'master'
+                echo DEPLOY_BRANCH + "$env.BRANCH_NAME"
+                if ("$env.BRANCH_NAME" == "$DEPLOY_BRANCH") {
+                    notifyBuild("DEPLOY STARTED")
+                    sh """#!/bin/bash -l
+                            cd ${
+                        WORKSPACE
+                    }/tools/cap && rvm use 2.7.0 && bundle install && bundle exec cap staging deploy BRANCH=$DEPLOY_BRANCH
+                        """
+                    notifyBuild("DEPLOY FINISHED")
+
+                }
+            }
+        }
+    }
+}
+
+def notifyBuild(String buildStatus = 'STARTED') {
+    buildStatus = buildStatus ?: 'SUCCESSFUL'
+
+    def colorName = 'RED'
+    def colorCode = '#FF0000'
+    def subject = "${buildStatus}: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]'"
+    def summary = "${subject} (${env.BUILD_URL})"
+    def details = """<p>STARTED: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]':</p>
+    <p>Check console output at &QUOT;<a href='${env.BUILD_URL}'>${env.JOB_NAME} [${env.BUILD_NUMBER}]</a>&QUOT;</p>"""
+
+    if (buildStatus == "DEPLOY STARTED") {
+        color = 'YELLOW'
+        colorCode = '#FFFF00'
+    }
+    if (buildStatus == "BUILD STARTED") {
+        color = 'YELLOW'
+        colorCode = '#FFFF00'
+    } else if (buildStatus == 'BUILD FINISHED') {
+        color = 'GREEN'
+        colorCode = '#00FF00'
+    } else if (buildStatus == 'DEPLOY FINISHED') {
+        color = 'GREEN'
+        colorCode = '#00FF00'
+    } else if (buildStatus == 'EPIC FAIL') {
+        color = 'RED'
+        colorCode = '#FF0000'
+    }
+
+    slackSend(color: colorCode, message: summary)
+}

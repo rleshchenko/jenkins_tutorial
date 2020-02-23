@@ -1,0 +1,41 @@
+pipeline {
+    agent {
+        docker {
+            image 'ozlz/test'
+        }
+    }
+    environment {
+        COMPOSER_AUTH = '{"http-basic":{"repo.magento.com": {"username": "6db5905a1a34f710e7ec7d517c09941a", "password": "69da3fa354be9e291e23d0de3954e9de"}}}'
+    }
+
+    parameters {
+        string defaultValue: 'master', description: '', name: 'Branch', trim: false
+    }
+    stages {
+        stage('Pull the repository') {
+            steps {
+                echo "hello ${params.Branch}"
+                git credentialsId: '64172638-aa35-4c0d-b0ad-9cf825152c07', url: 'git@github.com:FluidDigitalGit/modaM2.git', branch: "${params.Branch}"
+            }
+        }
+        stage('Composer install') {
+            steps {
+                sh 'service apache2 start'
+                sh 'update-alternatives --set php /usr/bin/php7.2'
+                sh 'composer install --no-interaction'
+            }
+        }
+        stage('Slug creation') {
+            steps {
+                sh 'chown -R mysql:mysql /var/lib/mysql /var/run/mysqld && service mysql start && mysql -uroot -p -e "DROP DATABASE IF EXISTS magento2; CREATE DATABASE magento2;"'
+                sh 'touch app/etc/env.php'
+                sh 'rm app/etc/env.php'
+                sh 'php bin/magento setup:install --base-url=http://127.0.0.1/ --db-host=localhost --db-name=magento2 --db-user=root --admin-firstname=Magento --admin-lastname=User --admin-email=user@example.com --admin-user=admin --admin-password=admin123 --language=en_US --currency=USD --timezone=America/Chicago --use-rewrites=1 --backend-frontname=admin'
+                sh 'php bin/magento setup:upgrade'
+                sh 'php bin/magento setup:di:compile'
+                sh 'php bin/magento setup:static-content:deploy -f'
+                sh 'truncate -s 0 var/log/*log'
+            }
+        }
+    }
+}

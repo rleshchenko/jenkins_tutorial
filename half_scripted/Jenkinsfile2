@@ -1,0 +1,95 @@
+def appArguments = '-u root:sudo ' +
+        '-v ${WORKSPACE}/docker/etc/php/php-fpm.conf:/usr/local/etc/php-fpm.conf ' +
+        '-v ${WORKSPACE}/docker/etc/php/xdebug.ini:/etc/php/conf.d/xdebug.ini ' +
+        '-v ${WORKSPACE}/docker/etc/php/xdebug.ini:/usr/local/etc/php/conf.d/xdebug.ini ' +
+        '-v ${WORKSPACE}/docker/etc/php/php.ini:/usr/local/etc/php/php.ini '
+pipeline {
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '3', artifactNumToKeepStr: '3'))
+    }
+    environment {
+        COMPOSER_AUTH = '{"http-basic":{"repo.magento.com": {"username": "6db5905a1a34f710e7ec7d517c09941a", "password": "69da3fa354be9e291e23d0de3954e9de"}}}'
+        HOST = sh(script: 'echo ${PWD##*/}', , returnStdout: true).trim()
+    }
+    parameters {
+        string defaultValue: 'master', description: '', name: 'Branch', trim: false
+    }
+    agent any
+    stages {
+        stage('Composer install') {
+            steps {
+                script {
+                    git credentialsId: 'github2', url: 'git@github.com:FluidDigitalGit/modaM2.git', branch: "${params.Branch}"
+                    docker.withRegistry('', 'dockerhub') {
+                        docker.image('mattfluiddigital/magento2:7.2.2-jenkins').withRun(
+                                appArguments
+                        ) { c ->
+                            docker.image('mattfluiddigital/magento2:7.2.2-jenkins').inside(
+                                    appArguments
+                            ) {
+                                sh 'composer install --no-interaction'
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        stage('Static tests') {
+            agent { label 'master' }
+            steps {
+                node(label: 'master') {
+                    script {
+                        catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                            docker.image('mattfluiddigital/magento2:7.2.2-jenkins').inside(
+                                    appArguments
+                            ) {
+                                sh "${WORKSPACE}/vendor/bin/phpcs --standard=vendor/magento/magento-coding-standard/Magento2 app/code app/design"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        stage('Slug creation') {
+            agent { label 'master' }
+            steps {
+                node(label: 'master') {
+                    script {
+                        docker.image('mysql:5.6').withRun('-u root:sudo -e MYSQL_ROOT_PASSWORD=root') { c ->
+                            docker.image('mysql:5.6').inside("-u root:sudo -p 3306:3306 -e MYSQL_ROOT_PASSWORD=root --link ${c.id}:db") {
+                                sh 'service mysql start'
+                            }
+                            docker.image('mattfluiddigital/magento2:7.2.2-jenkins').inside(
+                                    "--link ${c.id}:db " + appArguments
+                            ) {
+                                sh 'mysql -hdb -uroot -proot -e "DROP DATABASE IF EXISTS magento2; CREATE DATABASE magento2; use magento2;"'
+                                sh 'zcat ${WORKSPACE}/docker/modam2_dump.sql.gz | mysql -uroot -proot -hdb magento2'
+                                sh 'touch app/etc/env.php'
+                                sh 'rm app/etc/env.php'
+
+                                sh 'php bin/magento setup:install --base-url=http://35.214.69.92/ --db-host=db --db-name=magento2 --db-user=root --db-password=root --admin-firstname=Magento --admin-lastname=User --admin-email=user@example.com --admin-user=admin --admin-password=admin123 --language=en_US --currency=USD --timezone=America/Chicago --use-rewrites=1 --backend-frontname=admin'
+                                sh 'php bin/magento setup:upgrade'
+                                sh 'php bin/magento setup:di:compile'
+                                sh '. /opt/nvm/nvm.sh && nvm install v10.16.0 && nvm use v10.16.0 && cd ${WORKSPACE}/app/design/frontend/Fluid/blank && npm install  && npm install -g gulp && gulp && cd ${WORKSPACE}'
+                                sh 'php bin/magento setup:static-content:deploy -f'
+                                sh 'truncate -s 0 var/log/*log'
+                                sh 'ln -sfn ${WORKSPACE} /var/www/'
+                                sh 'rm ${WORKSPACE}/var/log/*'
+                                sh 'rm -rf ${WORKSPACE}/var/cache/*'
+                                sh '''
+                         chown -R www-data:www-data ${WORKSPACE}
+                     '''
+                                sh 'find app/code var/view_preprocessed vendor pub/static app/etc generated/code generated/metadata \\( -type f -or -type d \\) -exec chmod u-w {} + && chmod o-rwx app/etc/env.php && chmod u+x bin/magento'
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    post {
+        success {
+            sh "cd ${WORKSPACE}/tools/cap && bundle install &&  bundle exec cap staging deploy BRANCH=${params.Branch}"
+        }
+    }
+}
